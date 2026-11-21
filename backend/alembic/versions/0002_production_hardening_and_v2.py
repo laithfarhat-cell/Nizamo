@@ -84,8 +84,10 @@ def upgrade() -> None:
             """
         )
         op.execute(
+            "DROP TRIGGER IF EXISTS trg_prevent_posted_aml_mutation ON account_move_line;"
+        )
+        op.execute(
             """
-            DROP TRIGGER IF EXISTS trg_prevent_posted_aml_mutation ON account_move_line;
             CREATE TRIGGER trg_prevent_posted_aml_mutation
             BEFORE UPDATE OR DELETE ON account_move_line
             FOR EACH ROW

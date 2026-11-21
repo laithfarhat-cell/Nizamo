@@ -1,0 +1,52 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: nizamo_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-nizamo}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-nizamo}
+      POSTGRES_DB: ${POSTGRES_DB:-nizamo}
+    ports:
+      - "5432:5432"
+    volumes:
+      - nizamo_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-nizamo} -d ${POSTGRES_DB:-nizamo}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: nizamo_backend
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-nizamo}:${POSTGRES_PASSWORD:-nizamo}@postgres:5432/${POSTGRES_DB:-nizamo}
+      SYNC_DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-nizamo}:${POSTGRES_PASSWORD:-nizamo}@postgres:5432/${POSTGRES_DB:-nizamo}
+      JWT_SECRET: ${JWT_SECRET:-nizamo-erp-enterprise-secret-change-in-production-2026}
+    ports:
+      - "8000:8000"
+    command: >
+      sh -c "cd /app/backend && alembic upgrade head && cd /app && python scripts/seed_erp.py && uvicorn backend.main:app --host 0.0.0.0 --port 8000"
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: nizamo_frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    environment:
+      VITE_API_PROXY_TARGET: http://backend:8000
+    ports:
+      - "5173:5173"
+
+volumes:
+  nizamo_pgdata:

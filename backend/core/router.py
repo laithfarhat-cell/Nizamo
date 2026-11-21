@@ -16,8 +16,11 @@ from backend.core.database import get_db
 from backend.core.decimal_utils import D, quantize_db
 from backend.core.registry import registry
 from backend.core.security import (
+    ROLE_ADMIN,
     RequestContext,
     create_access_token,
+    create_refresh_token,
+    decode_access_token,
     get_current_context,
     require_permission,
     verify_password,
@@ -34,6 +37,10 @@ router = APIRouter(prefix="/core", tags=["Core Kernel"])
 class LoginRequest(BaseModel):
     login: str
     password: str
+
+
+class RefreshRequest(BaseModel):
+    refresh_token: str
 
 
 class PartnerCreate(BaseModel):
@@ -71,9 +78,11 @@ async def login(payload: LoginRequest, session: AsyncSession = Depends(get_db)) 
     user = (await session.execute(stmt)).scalar_one_or_none()
     if user is None or not verify_password(payload.password, user.password_hash):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
-    token = create_access_token(user.id, user.login)
+    access_token = create_access_token(user.id, user.login)
+    refresh_token = create_refresh_token(user.id, user.login)
     return {
-        "access_token": token,
+        "access_token": access_token,
+        "refresh_token": refresh_token,
         "token_type": "bearer",
         "user": {
             "id": user.id,
@@ -82,7 +91,23 @@ async def login(payload: LoginRequest, session: AsyncSession = Depends(get_db)) 
             "email": user.email,
             "roles": sorted(user.role_names),
             "default_company_id": user.default_company_id,
+            "allowed_company_ids": sorted(user.allowed_company_ids),
         },
+    }
+
+
+@router.post("/auth/refresh")
+async def refresh_token_endpoint(
+    payload: RefreshRequest, session: AsyncSession = Depends(get_db)
+) -> dict[str, Any]:
+    decoded = decode_access_token(payload.refresh_token, expected_type="refresh")
+    user = await session.get(ResUser, int(decoded["sub"]))
+    if user is None or not user.active:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User inactive or missing")
+    return {
+        "access_token": create_access_token(user.id, user.login),
+        "refresh_token": create_refresh_token(user.id, user.login),
+        "token_type": "bearer",
     }
 
 
@@ -113,7 +138,10 @@ async def list_companies(
     ctx: RequestContext = Depends(get_current_context),
     session: AsyncSession = Depends(get_db),
 ) -> list[dict[str, Any]]:
-    stmt = select(ResCompany).where(ResCompany.active.is_(True)).order_by(ResCompany.id.asc())
+    stmt = select(ResCompany).where(ResCompany.active.is_(True))
+    if ROLE_ADMIN not in ctx.user.role_names:
+        stmt = stmt.where(ResCompany.id.in_(ctx.user.allowed_company_ids))
+    stmt = stmt.order_by(ResCompany.id.asc())
     companies = (await session.execute(stmt)).scalars().all()
     return [
         {

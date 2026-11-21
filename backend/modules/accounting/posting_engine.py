@@ -831,3 +831,267 @@ async def reverse_move(
                         break
 
     return await get_move_with_lines(session, rev_move.id)
+
+
+async def update_draft_move(
+    session: AsyncSession,
+    move_id: int,
+    *,
+    move_date: date | None = None,
+    invoice_date_due: date | None = None,
+    partner_id: int | None = None,
+    currency_id: int | None = None,
+    ref: str | None = None,
+    narration: str | None = None,
+    journal_lines: list[JournalLineInput] | None = None,
+    invoice_lines: list[InvoiceLineInput] | None = None,
+    author_name: str = "System",
+    author_id: int | None = None,
+) -> AccountMove:
+    """Edit a DRAFT AccountMove header and/or rebuild its lines, logging field diffs to Audit Chatter.
+
+    Unconditionally rejects editing POSTED or CANCELLED entries via `enforce_move_mutable()`.
+    """
+    move = await enforce_move_mutable(session, move_id)
+    company = await session.get(ResCompany, move.company_id)
+    if company is None:
+        raise AccountingError(f"Company {move.company_id} not found")
+    base_curr = await session.get(ResCurrency, company.currency_id)
+    base_prec = base_curr.decimal_places if base_curr else 2
+
+    diffs: list[tuple[str, str, object, object]] = []
+    old_total = move.amount_total
+
+    if move_date is not None and move_date != move.date:
+        diffs.append(("date", "Accounting Date", move.date, move_date))
+        move.date = move_date
+        if move.invoice_date is not None:
+            move.invoice_date = move_date
+    if invoice_date_due is not None and invoice_date_due != move.invoice_date_due:
+        diffs.append(("invoice_date_due", "Due Date", move.invoice_date_due, invoice_date_due))
+        move.invoice_date_due = invoice_date_due
+    if partner_id is not None and partner_id != move.partner_id:
+        diffs.append(("partner_id", "Partner ID", move.partner_id, partner_id))
+        move.partner_id = partner_id
+    if currency_id is not None and currency_id != move.currency_id:
+        diffs.append(("currency_id", "Currency ID", move.currency_id, currency_id))
+        move.currency_id = currency_id
+    if ref is not None and ref != move.ref:
+        diffs.append(("ref", "Reference", move.ref, ref))
+        move.ref = ref
+    if narration is not None and narration != move.narration:
+        move.narration = narration
+
+    doc_curr = await session.get(ResCurrency, move.currency_id)
+    doc_prec = doc_curr.decimal_places if doc_curr else 2
+    move.exchange_rate = await get_effective_rate(
+        session, company_id=move.company_id, currency_id=move.currency_id, as_of_date=move.date
+    )
+
+    if move.move_type == "entry" and journal_lines is not None:
+        if len(journal_lines) < 2:
+            raise AccountingError("Journal entry must have at least 2 lines")
+        for existing in list(move.lines):
+            await session.delete(existing)
+        await session.flush()
+
+        total_debit = ZERO
+        for li in journal_lines:
+            line_curr_id = li.currency_id or move.currency_id
+            debit = quantize_currency(D(li.debit), base_prec)
+            credit = quantize_currency(D(li.credit), base_prec)
+            if debit < ZERO or credit < ZERO:
+                raise AccountingError("Journal line debit and credit must be non-negative")
+            if debit > ZERO and credit > ZERO:
+                raise AccountingError("A single journal line cannot have both positive debit and credit")
+            balance = debit - credit
+            amt_curr = (
+                quantize_currency(D(li.amount_currency), doc_prec)
+                if li.amount_currency is not None
+                else balance
+            )
+            total_debit += debit
+            session.add(
+                AccountMoveLine(
+                    company_id=move.company_id,
+                    move_id=move.id,
+                    account_id=li.account_id,
+                    partner_id=li.partner_id if li.partner_id is not None else move.partner_id,
+                    analytic_account_id=li.analytic_account_id,
+                    product_id=li.product_id,
+                    name=li.name,
+                    debit=debit,
+                    credit=credit,
+                    balance=balance,
+                    currency_id=line_curr_id,
+                    amount_currency=amt_curr,
+                    date=move.date,
+                    date_maturity=li.date_maturity or move.date,
+                    display_type=li.display_type,
+                )
+            )
+        move.amount_total = quantize_currency(total_debit, base_prec)
+        move.amount_untaxed = move.amount_total
+
+    elif move.move_type != "entry" and invoice_lines is not None:
+        if not invoice_lines:
+            raise AccountingError("Invoice must contain at least one line")
+        for existing in list(move.lines):
+            await session.delete(existing)
+        await session.flush()
+
+        is_sale = move.move_type in ("out_invoice", "out_refund")
+        is_refund = move.move_type in ("out_refund", "in_refund")
+        product_is_credit = move.move_type in ("out_invoice", "in_refund")
+        due_dt = move.invoice_date_due or move.date
+
+        control_account = await _resolve_partner_control_account(
+            session, company_id=move.company_id, partner_id=move.partner_id, is_receivable=is_sale
+        )
+        all_tax_ids = {tid for li in invoice_lines for tid in li.tax_ids}
+        taxes_by_id: dict[int, AccountTax] = {}
+        if all_tax_ids:
+            t_rows = (
+                await session.execute(select(AccountTax).where(AccountTax.id.in_(all_tax_ids)))
+            ).scalars().all()
+            taxes_by_id = {t.id: t for t in t_rows}
+
+        total_untaxed_curr = ZERO
+        total_tax_curr = ZERO
+        total_base_opposite = ZERO
+        grouped_taxes: dict[tuple[int, int, str], Decimal] = {}
+
+        for li in invoice_lines:
+            line_taxes = [taxes_by_id[tid] for tid in li.tax_ids if tid in taxes_by_id]
+            tax_res = compute_line_taxes(
+                price_unit=D(li.price_unit),
+                quantity=D(li.quantity),
+                discount=D(li.discount),
+                taxes=line_taxes,
+                currency_precision=doc_prec,
+                is_refund=is_refund,
+            )
+            line_sub_curr = tax_res.total_excluded
+            total_untaxed_curr += line_sub_curr
+            base_amt, _ = await convert_to_company_currency(
+                session,
+                amount=line_sub_curr,
+                currency_id=move.currency_id,
+                company_id=move.company_id,
+                as_of_date=move.date,
+            )
+            total_base_opposite += base_amt
+            debit, credit = (ZERO, base_amt) if product_is_credit else (base_amt, ZERO)
+            amt_curr = -line_sub_curr if product_is_credit else line_sub_curr
+
+            session.add(
+                AccountMoveLine(
+                    company_id=move.company_id,
+                    move_id=move.id,
+                    account_id=li.account_id,
+                    partner_id=move.partner_id,
+                    analytic_account_id=li.analytic_account_id,
+                    product_id=li.product_id,
+                    name=li.name,
+                    quantity=D(li.quantity),
+                    price_unit=D(li.price_unit),
+                    discount=D(li.discount),
+                    debit=debit,
+                    credit=credit,
+                    balance=debit - credit,
+                    currency_id=move.currency_id,
+                    amount_currency=amt_curr,
+                    date=move.date,
+                    date_maturity=due_dt,
+                    tax_ids_json=json.dumps(li.tax_ids) if li.tax_ids else None,
+                    is_tax_line=False,
+                    display_type="product",
+                )
+            )
+            for tl in tax_res.tax_lines:
+                key = (tl.tax_id, tl.account_id, tl.name)
+                grouped_taxes[key] = grouped_taxes.get(key, ZERO) + tl.amount
+
+        for (tax_id, tax_account_id, tax_name), tax_amt_curr in grouped_taxes.items():
+            tax_amt_curr = quantize_currency(tax_amt_curr, doc_prec)
+            if tax_amt_curr == ZERO:
+                continue
+            total_tax_curr += tax_amt_curr
+            tax_base_amt, _ = await convert_to_company_currency(
+                session,
+                amount=tax_amt_curr,
+                currency_id=move.currency_id,
+                company_id=move.company_id,
+                as_of_date=move.date,
+            )
+            total_base_opposite += tax_base_amt
+            t_debit, t_credit = (ZERO, tax_base_amt) if product_is_credit else (tax_base_amt, ZERO)
+            t_amt_curr = -tax_amt_curr if product_is_credit else tax_amt_curr
+            session.add(
+                AccountMoveLine(
+                    company_id=move.company_id,
+                    move_id=move.id,
+                    account_id=tax_account_id,
+                    partner_id=move.partner_id,
+                    name=f"Tax: {tax_name}",
+                    quantity=ONE,
+                    price_unit=tax_amt_curr,
+                    debit=t_debit,
+                    credit=t_credit,
+                    balance=t_debit - t_credit,
+                    currency_id=move.currency_id,
+                    amount_currency=t_amt_curr,
+                    date=move.date,
+                    date_maturity=due_dt,
+                    tax_line_id=tax_id,
+                    is_tax_line=True,
+                    display_type="tax",
+                )
+            )
+
+        total_curr = quantize_currency(total_untaxed_curr + total_tax_curr, doc_prec)
+        total_base = quantize_currency(total_base_opposite, base_prec)
+        cp_debit, cp_credit = (total_base, ZERO) if product_is_credit else (ZERO, total_base)
+        cp_amt_curr = total_curr if product_is_credit else -total_curr
+
+        session.add(
+            AccountMoveLine(
+                company_id=move.company_id,
+                move_id=move.id,
+                account_id=control_account.id,
+                partner_id=move.partner_id,
+                name=f"{control_account.name} ({move.ref or move.move_type})",
+                quantity=ONE,
+                price_unit=total_curr,
+                debit=cp_debit,
+                credit=cp_credit,
+                balance=cp_debit - cp_credit,
+                currency_id=move.currency_id,
+                amount_currency=cp_amt_curr,
+                date=move.date,
+                date_maturity=due_dt,
+                is_tax_line=False,
+                display_type="payment_term",
+            )
+        )
+        move.amount_untaxed = quantize_currency(total_untaxed_curr, doc_prec)
+        move.amount_tax = quantize_currency(total_tax_curr, doc_prec)
+        move.amount_total = total_curr
+        move.amount_residual = total_curr
+
+    if move.amount_total != old_total:
+        diffs.append(("amount_total", "Total Amount", old_total, move.amount_total))
+
+    await session.flush()
+    await log_chatter(
+        session,
+        company_id=move.company_id,
+        res_model="account_move",
+        res_id=move.id,
+        body="Draft document updated",
+        author_name=author_name,
+        author_id=author_id,
+        diffs=diffs,
+    )
+    return await get_move_with_lines(session, move.id)
+

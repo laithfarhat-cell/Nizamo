@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import date
+from datetime import date, date as DateType
 from decimal import Decimal
 from typing import Any
 
@@ -17,9 +17,23 @@ from backend.core.database import get_db
 from backend.core.decimal_utils import D, ONE, ZERO, quantize_currency
 from backend.core.security import RequestContext, get_current_context, require_permission
 from backend.core.tenancy import ResCurrency, ResPartner
+from backend.modules.accounting.bank_reconciliation import (
+    import_bank_statement_csv,
+    reconcile_bank_statement_line,
+    serialize_statement_with_suggestions,
+)
+from backend.modules.accounting.closing_engine import (
+    execute_fiscal_year_closing,
+    execute_fx_revaluation,
+    preview_fiscal_year_closing,
+    preview_fx_revaluation,
+)
+from backend.modules.accounting.invoice_pdf import generate_invoice_pdf
 from backend.modules.accounting.models import (
     AccountAccount,
     AccountAnalyticAccount,
+    AccountBankStatement,
+    AccountFiscalClosing,
     AccountJournal,
     AccountMove,
     AccountMoveLine,
@@ -39,6 +53,7 @@ from backend.modules.accounting.posting_engine import (
     get_move_with_lines,
     post_move,
     reverse_move,
+    update_draft_move,
 )
 from backend.modules.accounting.reconciliation import reconcile_move_lines, register_payment
 from backend.modules.accounting.reports import (
@@ -549,6 +564,129 @@ async def create_move_endpoint(
         raise _handle_accounting_error(exc) from exc
 
 
+class MoveUpdateRequest(BaseModel):
+    date: DateType | None = None
+    invoice_date_due: DateType | None = None
+    partner_id: int | None = None
+    currency_id: int | None = None
+    ref: str | None = None
+    narration: str | None = None
+    journal_lines: list[JournalLineSchema] | None = None
+    invoice_lines: list[InvoiceLineSchema] | None = None
+
+
+class FiscalClosingRequest(BaseModel):
+    date_from: date
+    date_to: date
+    retained_earnings_account_id: int | None = None
+    lock_fiscal_year: bool = True
+
+
+class FxRevaluationRequest(BaseModel):
+    revaluation_date: date
+    auto_reverse_next_day: bool = True
+
+
+class BankStatementImportRequest(BaseModel):
+    journal_id: int
+    name: str
+    statement_date: date | None = None
+    balance_start: Decimal = ZERO
+    csv_text: str
+
+
+class ReconcileStatementLineRequest(BaseModel):
+    invoice_move_id: int | None = None
+    counterpart_account_id: int | None = None
+
+
+@router.put("/moves/{move_id}")
+async def update_move_endpoint(
+    move_id: int,
+    payload: MoveUpdateRequest,
+    ctx: RequestContext = Depends(require_permission("account_move", "write")),
+    session: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    try:
+        existing = await get_move_with_lines(session, move_id)
+        if existing.company_id != ctx.company_id:
+            raise HTTPException(status_code=404, detail="Move not found in active company")
+        move = await update_draft_move(
+            session,
+            move_id,
+            move_date=payload.date,
+            invoice_date_due=payload.invoice_date_due,
+            partner_id=payload.partner_id,
+            currency_id=payload.currency_id,
+            ref=payload.ref,
+            narration=payload.narration,
+            journal_lines=(
+                [
+                    JournalLineInput(
+                        account_id=l.account_id,
+                        name=l.name,
+                        partner_id=l.partner_id,
+                        analytic_account_id=l.analytic_account_id,
+                        debit=l.debit,
+                        credit=l.credit,
+                        amount_currency=l.amount_currency,
+                        currency_id=l.currency_id,
+                        date_maturity=l.date_maturity,
+                    )
+                    for l in payload.journal_lines
+                ]
+                if payload.journal_lines is not None
+                else None
+            ),
+            invoice_lines=(
+                [
+                    InvoiceLineInput(
+                        account_id=l.account_id,
+                        name=l.name,
+                        quantity=l.quantity,
+                        price_unit=l.price_unit,
+                        discount=l.discount,
+                        tax_ids=l.tax_ids,
+                        analytic_account_id=l.analytic_account_id,
+                        product_id=l.product_id,
+                    )
+                    for l in payload.invoice_lines
+                ]
+                if payload.invoice_lines is not None
+                else None
+            ),
+            author_name=ctx.user.full_name,
+            author_id=ctx.user.id,
+        )
+        return await _serialize_move(session, move)
+    except AccountingError as exc:
+        raise _handle_accounting_error(exc) from exc
+
+
+@router.get("/moves/{move_id}/pdf")
+async def download_move_pdf(
+    move_id: int,
+    ctx: RequestContext = Depends(get_current_context),
+    session: AsyncSession = Depends(get_db),
+) -> Response:
+    try:
+        move = await get_move_with_lines(session, move_id)
+    except AccountingError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    if move.company_id != ctx.company_id:
+        raise HTTPException(status_code=404, detail="Move not found in active company")
+    pdf_bytes, qr_b64 = await generate_invoice_pdf(session, move)
+    safe_name = move.name.replace("/", "_").replace(" ", "_")
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'attachment; filename="{safe_name}.pdf"',
+            "X-ZATCA-QR-Base64": qr_b64,
+        },
+    )
+
+
 @router.post("/moves/{move_id}/post")
 async def post_move_endpoint(
     move_id: int,
@@ -826,3 +964,165 @@ async def report_aged_partner(
         target_move=target_move,
     )
     return _export_response(data, export)
+
+
+# --- Year-End Fiscal Closing Wizard ---
+
+@router.get("/fiscal-closing/preview")
+async def fiscal_closing_preview(
+    date_from: date = Query(...),
+    date_to: date = Query(...),
+    ctx: RequestContext = Depends(require_permission("account_move", "read")),
+    session: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    try:
+        return await preview_fiscal_year_closing(
+            session, company_id=ctx.company_id, date_from=date_from, date_to=date_to
+        )
+    except AccountingError as exc:
+        raise _handle_accounting_error(exc) from exc
+
+
+@router.post("/fiscal-closing", status_code=201)
+async def fiscal_closing_execute(
+    payload: FiscalClosingRequest,
+    ctx: RequestContext = Depends(require_permission("account_move", "create")),
+    session: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    try:
+        return await execute_fiscal_year_closing(
+            session,
+            company_id=ctx.company_id,
+            date_from=payload.date_from,
+            date_to=payload.date_to,
+            retained_earnings_account_id=payload.retained_earnings_account_id,
+            lock_fiscal_year=payload.lock_fiscal_year,
+            author_name=ctx.user.full_name,
+            author_id=ctx.user.id,
+        )
+    except AccountingError as exc:
+        raise _handle_accounting_error(exc) from exc
+
+
+@router.get("/fiscal-closing/history")
+async def fiscal_closing_history(
+    ctx: RequestContext = Depends(get_current_context),
+    session: AsyncSession = Depends(get_db),
+) -> list[dict[str, Any]]:
+    rows = (
+        await session.execute(
+            select(AccountFiscalClosing)
+            .where(AccountFiscalClosing.company_id == ctx.company_id)
+            .order_by(AccountFiscalClosing.id.desc())
+        )
+    ).scalars().all()
+    return [
+        {
+            "id": r.id,
+            "name": r.name,
+            "date_from": r.date_from.isoformat(),
+            "date_to": r.date_to.isoformat(),
+            "net_profit": str(quantize_currency(r.net_profit)),
+            "closing_move_id": r.closing_move_id,
+            "created_at": r.created_at.isoformat(),
+        }
+        for r in rows
+    ]
+
+
+# --- Unrealized Foreign Exchange Revaluation (IAS 21) ---
+
+@router.get("/fx-revaluation/preview")
+async def fx_revaluation_preview(
+    revaluation_date: date = Query(...),
+    ctx: RequestContext = Depends(require_permission("account_move", "read")),
+    session: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    try:
+        return await preview_fx_revaluation(
+            session, company_id=ctx.company_id, revaluation_date=revaluation_date
+        )
+    except AccountingError as exc:
+        raise _handle_accounting_error(exc) from exc
+
+
+@router.post("/fx-revaluation", status_code=201)
+async def fx_revaluation_execute(
+    payload: FxRevaluationRequest,
+    ctx: RequestContext = Depends(require_permission("account_move", "create")),
+    session: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    try:
+        return await execute_fx_revaluation(
+            session,
+            company_id=ctx.company_id,
+            revaluation_date=payload.revaluation_date,
+            auto_reverse_next_day=payload.auto_reverse_next_day,
+            author_name=ctx.user.full_name,
+            author_id=ctx.user.id,
+        )
+    except AccountingError as exc:
+        raise _handle_accounting_error(exc) from exc
+
+
+# --- Bank Statement Import & Reconciliation ---
+
+@router.get("/bank-statements")
+async def list_bank_statements(
+    ctx: RequestContext = Depends(get_current_context),
+    session: AsyncSession = Depends(get_db),
+) -> list[dict[str, Any]]:
+    stmts = (
+        await session.execute(
+            select(AccountBankStatement)
+            .options(selectinload(AccountBankStatement.lines))
+            .where(AccountBankStatement.company_id == ctx.company_id)
+            .order_by(AccountBankStatement.id.desc())
+        )
+    ).scalars().all()
+    return [await serialize_statement_with_suggestions(session, s) for s in stmts]
+
+
+@router.post("/bank-statements/import-csv", status_code=201)
+async def import_bank_statement_endpoint(
+    payload: BankStatementImportRequest,
+    ctx: RequestContext = Depends(require_permission("account_payment", "create")),
+    session: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    try:
+        stmt = await import_bank_statement_csv(
+            session,
+            company_id=ctx.company_id,
+            journal_id=payload.journal_id,
+            name=payload.name,
+            csv_text=payload.csv_text,
+            statement_date=payload.statement_date,
+            balance_start=payload.balance_start,
+            author_name=ctx.user.full_name,
+            author_id=ctx.user.id,
+        )
+        return await serialize_statement_with_suggestions(session, stmt)
+    except AccountingError as exc:
+        raise _handle_accounting_error(exc) from exc
+
+
+@router.post("/bank-statements/lines/{line_id}/reconcile")
+async def reconcile_bank_line_endpoint(
+    line_id: int,
+    payload: ReconcileStatementLineRequest,
+    ctx: RequestContext = Depends(require_permission("account_payment", "create")),
+    session: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    try:
+        return await reconcile_bank_statement_line(
+            session,
+            line_id=line_id,
+            company_id=ctx.company_id,
+            invoice_move_id=payload.invoice_move_id,
+            counterpart_account_id=payload.counterpart_account_id,
+            author_name=ctx.user.full_name,
+            author_id=ctx.user.id,
+        )
+    except AccountingError as exc:
+        raise _handle_accounting_error(exc) from exc
+

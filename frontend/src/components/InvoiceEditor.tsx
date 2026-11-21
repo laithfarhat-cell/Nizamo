@@ -1,7 +1,7 @@
 import React, { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { FileText, Plus, Trash2, Wallet } from "lucide-react";
-import { apiRequest, formatMoney } from "../api/client";
+import { apiRequest, downloadReportExport, formatMoney } from "../api/client";
 import type {
   Account,
   AccountMove,
@@ -46,6 +46,11 @@ export const InvoiceEditor: React.FC<InvoiceEditorProps> = ({
   const [activeTab, setActiveTab] = useState<"lines" | "journal_items">("lines");
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [payModalOpen, setPayModalOpen] = useState(false);
+  const [isEditingDraft, setIsEditingDraft] = useState(false);
+  const [editDate, setEditDate] = useState("");
+  const [editDueDate, setEditDueDate] = useState("");
+  const [editRef, setEditRef] = useState("");
+  const [editNarration, setEditNarration] = useState("");
 
   // Master data queries
   const { data: accounts = [] } = useQuery<Account[]>({
@@ -662,6 +667,39 @@ export const InvoiceEditor: React.FC<InvoiceEditorProps> = ({
       onClick: () => postMutation.mutate(move.id),
     });
     actions.push({
+      id: "edit_draft",
+      label: isEditingDraft ? t(locale, "saveChanges") : t(locale, "editDraft"),
+      variant: "secondary",
+      onClick: async () => {
+        if (!isEditingDraft) {
+          setEditDate(move.date);
+          setEditDueDate(move.invoice_date_due || "");
+          setEditRef(move.ref || "");
+          setEditNarration(move.narration || "");
+          setIsEditingDraft(true);
+        } else {
+          try {
+            setErrorMsg(null);
+            await apiRequest(`/accounting/moves/${move.id}`, {
+              method: "PUT",
+              body: JSON.stringify({
+                date: editDate || move.date,
+                invoice_date_due: editDueDate || null,
+                ref: editRef || null,
+                narration: editNarration || null,
+              }),
+            });
+            setIsEditingDraft(false);
+            await queryClient.invalidateQueries({ queryKey: ["move", move.id] });
+            await queryClient.invalidateQueries({ queryKey: ["moves"] });
+            await queryClient.invalidateQueries({ queryKey: ["chatter", "account_move", move.id] });
+          } catch (e: unknown) {
+            setErrorMsg(e instanceof Error ? e.message : "Failed to update draft");
+          }
+        }
+      },
+    });
+    actions.push({
       id: "cancel",
       label: t(locale, "cancel"),
       variant: "danger",
@@ -691,7 +729,16 @@ export const InvoiceEditor: React.FC<InvoiceEditorProps> = ({
       id: "print",
       label: t(locale, "printPdf"),
       variant: "secondary",
-      onClick: () => window.print(),
+      onClick: async () => {
+        try {
+          await downloadReportExport(
+            `/accounting/moves/${move.id}/pdf`,
+            `${move.name.replace(/\//g, "_")}.pdf`
+          );
+        } catch (e: unknown) {
+          setErrorMsg(e instanceof Error ? e.message : "PDF download failed");
+        }
+      },
     });
   }
 
@@ -743,6 +790,44 @@ export const InvoiceEditor: React.FC<InvoiceEditorProps> = ({
         chatter={{ resModel: "account_move", resId: move.id }}
       >
         {/* Document Metadata */}
+        {isEditingDraft && move.state === "DRAFT" ? (
+          <div className="grid grid-cols-1 gap-3 md:grid-cols-4 text-xs bg-amber-50/60 border border-amber-200 rounded-lg p-3 mb-3">
+            <div>
+              <label className="text-slate-600 font-medium block mb-1">Accounting Date</label>
+              <input
+                type="date"
+                value={editDate}
+                onChange={(e) => setEditDate(e.target.value)}
+                className="w-full border border-slate-300 rounded px-2 py-1"
+              />
+            </div>
+            <div>
+              <label className="text-slate-600 font-medium block mb-1">Due Date</label>
+              <input
+                type="date"
+                value={editDueDate}
+                onChange={(e) => setEditDueDate(e.target.value)}
+                className="w-full border border-slate-300 rounded px-2 py-1"
+              />
+            </div>
+            <div>
+              <label className="text-slate-600 font-medium block mb-1">Reference</label>
+              <input
+                value={editRef}
+                onChange={(e) => setEditRef(e.target.value)}
+                className="w-full border border-slate-300 rounded px-2 py-1"
+              />
+            </div>
+            <div>
+              <label className="text-slate-600 font-medium block mb-1">Notes</label>
+              <input
+                value={editNarration}
+                onChange={(e) => setEditNarration(e.target.value)}
+                className="w-full border border-slate-300 rounded px-2 py-1"
+              />
+            </div>
+          </div>
+        ) : null}
         <div className="grid grid-cols-2 gap-4 md:grid-cols-4 text-xs">
           <div>
             <div className="text-slate-400 font-medium">Partner</div>

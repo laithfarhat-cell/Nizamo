@@ -1,0 +1,99 @@
+name: Nizamo ERP CI (PostgreSQL 16 + FastAPI + React)
+
+on:
+  push:
+    branches: [main, "arena/**"]
+  pull_request:
+    branches: [main]
+
+jobs:
+  backend-postgres:
+    name: Backend Tests & Alembic (PostgreSQL 16)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: nizamo
+          POSTGRES_PASSWORD: nizamo_ci_password
+          POSTGRES_DB: nizamo_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: backend/requirements.txt
+
+      - name: Install backend dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r backend/requirements.txt
+
+      - name: Run Alembic Migrations (0001 + 0002 incl. PG Immutability Trigger)
+        env:
+          DATABASE_URL: postgresql+asyncpg://nizamo:nizamo_ci_password@localhost:5432/nizamo_ci
+        run: |
+          cd backend && alembic upgrade head
+
+      - name: Run Seed Idempotency Check on PostgreSQL 16
+        env:
+          DATABASE_URL: postgresql+asyncpg://nizamo:nizamo_ci_password@localhost:5432/nizamo_ci
+        run: |
+          python scripts/seed_erp.py
+          python scripts/seed_erp.py
+
+      - name: Verify PostgreSQL Immutability Trigger Blocks Posted Move Mutation
+        env:
+          DATABASE_URL: postgresql+asyncpg://nizamo:nizamo_ci_password@localhost:5432/nizamo_ci
+        run: |
+          python - <<'EOF'
+          import asyncio, os, asyncpg
+          async def check():
+              conn = await asyncpg.connect(os.environ["DATABASE_URL"].replace("+asyncpg", ""))
+              try:
+                  row = await conn.fetchrow(
+                      "SELECT l.id FROM account_move_line l JOIN account_move m ON m.id=l.move_id WHERE m.state='POSTED' LIMIT 1"
+                  )
+                  assert row is not None, "Expected at least one POSTED move line"
+                  try:
+                      await conn.execute("UPDATE account_move_line SET debit = debit + 1 WHERE id = $1", row["id"])
+                      raise AssertionError("Trigger FAILED to block UPDATE on posted line!")
+                  except asyncpg.RaiseError as e:
+                      assert "Immutable Ledger Trigger" in str(e)
+                      print("PG Immutability Trigger verified:", e)
+              finally:
+                  await conn.close()
+          asyncio.run(check())
+          EOF
+
+      - name: Run Pytest Suite (Core Double-Entry + v2 Enterprise Suite)
+        run: pytest -v
+
+  frontend-build:
+    name: Frontend TypeScript & Vite Production Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install & Build Frontend
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build

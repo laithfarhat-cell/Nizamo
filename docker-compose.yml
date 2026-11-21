@@ -2,10 +2,9 @@ services:
   postgres:
     image: postgres:16-alpine
     container_name: nizamo_postgres
-    restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-nizamo}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-nizamo}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-nizamo_secret}
       POSTGRES_DB: ${POSTGRES_DB:-nizamo}
     ports:
       - "5432:5432"
@@ -22,31 +21,34 @@ services:
       context: .
       dockerfile: backend/Dockerfile
     container_name: nizamo_backend
-    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-nizamo}:${POSTGRES_PASSWORD:-nizamo_secret}@postgres:5432/${POSTGRES_DB:-nizamo}
+      JWT_SECRET: ${JWT_SECRET:-nizamo-enterprise-jwt-secret-change-in-prod}
+      ALLOW_DEMO_FALLBACK: ${ALLOW_DEMO_FALLBACK:-true}
+      CORS_ORIGINS: '["*"]'
+    ports:
+      - "8000:8000"
     depends_on:
       postgres:
         condition: service_healthy
-    environment:
-      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-nizamo}:${POSTGRES_PASSWORD:-nizamo}@postgres:5432/${POSTGRES_DB:-nizamo}
-      SYNC_DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-nizamo}:${POSTGRES_PASSWORD:-nizamo}@postgres:5432/${POSTGRES_DB:-nizamo}
-      JWT_SECRET: ${JWT_SECRET:-nizamo-erp-enterprise-secret-change-in-production-2026}
-    ports:
-      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
     command: >
-      sh -c "cd /app/backend && alembic upgrade head && cd /app && python scripts/seed_erp.py && uvicorn backend.main:app --host 0.0.0.0 --port 8000"
+      sh -c "cd /app/backend && alembic upgrade head && cd /app && python scripts/seed_erp.py && uvicorn backend.main:app --host 0.0.0.0 --port 8000 --workers 2"
 
   frontend:
     build:
       context: ./frontend
       dockerfile: Dockerfile
     container_name: nizamo_frontend
-    restart: unless-stopped
-    depends_on:
-      - backend
-    environment:
-      VITE_API_PROXY_TARGET: http://backend:8000
     ports:
-      - "5173:5173"
+      - "5173:80"
+    depends_on:
+      backend:
+        condition: service_healthy
 
 volumes:
   nizamo_pgdata:

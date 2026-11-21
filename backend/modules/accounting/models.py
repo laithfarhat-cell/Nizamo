@@ -10,6 +10,7 @@ from sqlalchemy import (
     CheckConstraint,
     Date,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
@@ -139,6 +140,9 @@ class AccountMove(Base, TimestampMixin, CompanyScopedMixin):
     """Unified Double-Entry Document Header: Journal Entries, Invoices, Vendor Bills, Credit Notes, Payments."""
 
     __tablename__ = "account_move"
+    __table_args__ = (
+        Index("ix_move_company_state_date_type", "company_id", "state", "date", "move_type"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     name: Mapped[str] = mapped_column(String(64), default="DRAFT", nullable=False, index=True)
@@ -194,6 +198,7 @@ class AccountMoveLine(Base, TimestampMixin, CompanyScopedMixin):
     __tablename__ = "account_move_line"
     __table_args__ = (
         CheckConstraint("debit >= 0 AND credit >= 0", name="ck_aml_non_negative_dc"),
+        Index("ix_aml_company_account_date", "company_id", "account_id", "date"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -303,3 +308,73 @@ class AccountPartialReconcile(Base, TimestampMixin, CompanyScopedMixin):
     exchange_move_id: Mapped[int | None] = mapped_column(
         Integer, ForeignKey("account_move.id", ondelete="SET NULL"), nullable=True
     )
+
+
+class AccountBankStatement(Base, TimestampMixin, CompanyScopedMixin):
+    """Imported Bank Statement batch for bank feed matching & reconciliation."""
+
+    __tablename__ = "account_bank_statement"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    journal_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("account_journal.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    balance_start: Mapped[Decimal] = mapped_column(FixedDecimal, default=ZERO, nullable=False)
+    balance_end_real: Mapped[Decimal] = mapped_column(FixedDecimal, default=ZERO, nullable=False)
+    state: Mapped[str] = mapped_column(String(16), default="OPEN", nullable=False)  # OPEN, POSTED
+
+    lines: Mapped[list[AccountBankStatementLine]] = relationship(
+        "AccountBankStatementLine",
+        back_populates="statement",
+        cascade="all, delete-orphan",
+        order_by="AccountBankStatementLine.id",
+    )
+
+
+class AccountBankStatementLine(Base, TimestampMixin, CompanyScopedMixin):
+    """Individual bank feed transaction line matched & reconciled against open AR/AP invoices or GL accounts."""
+
+    __tablename__ = "account_bank_statement_line"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    statement_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("account_bank_statement.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    payment_ref: Mapped[str] = mapped_column(String(256), nullable=False)
+    partner_name_raw: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    partner_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("res_partner.id", ondelete="SET NULL"), nullable=True
+    )
+    # Positive = inbound cash deposit; Negative = outbound bank disbursement
+    amount: Mapped[Decimal] = mapped_column(FixedDecimal, nullable=False)
+    is_reconciled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, index=True)
+    matched_move_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("account_move.id", ondelete="SET NULL"), nullable=True
+    )
+    payment_move_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("account_move.id", ondelete="SET NULL"), nullable=True
+    )
+
+    statement: Mapped[AccountBankStatement] = relationship("AccountBankStatement", back_populates="lines")
+
+
+class AccountFiscalClosing(Base, TimestampMixin, CompanyScopedMixin):
+    """Audit record of executed Fiscal Year-End Closings transferring Net Profit to Retained Earnings."""
+
+    __tablename__ = "account_fiscal_closing"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    date_from: Mapped[date] = mapped_column(Date, nullable=False)
+    date_to: Mapped[date] = mapped_column(Date, nullable=False)
+    net_profit: Mapped[Decimal] = mapped_column(FixedDecimal, nullable=False)
+    retained_earnings_account_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("account_account.id", ondelete="RESTRICT"), nullable=False
+    )
+    closing_move_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("account_move.id", ondelete="RESTRICT"), nullable=False
+    )
+

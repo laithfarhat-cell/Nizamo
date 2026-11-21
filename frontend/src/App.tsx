@@ -12,8 +12,10 @@ import { FinancialReports } from "./components/FinancialReports";
 import { OrdersWorkspace } from "./components/OrdersWorkspace";
 import { InventoryWorkspace } from "./components/InventoryWorkspace";
 import { ConfigurationView, ContactsView } from "./components/ContactsAndConfig";
+import { LoginModal } from "./components/LoginModal";
+import { PeriodClosingAndBank } from "./components/PeriodClosingAndBank";
 
-type AccountingSubView = "dashboard" | "moves" | "invoices" | "bills" | "reports";
+type AccountingSubView = "dashboard" | "moves" | "invoices" | "bills" | "reports" | "bank_closing";
 
 export const App: React.FC = () => {
   const queryClient = useQueryClient();
@@ -21,6 +23,7 @@ export const App: React.FC = () => {
   const [acctView, setAcctView] = useState<AccountingSubView>("dashboard");
   const [locale, setLocale] = useState<Locale>("en");
   const [companyId, setCompanyId] = useState<number | null>(null);
+  const [loginOpen, setLoginOpen] = useState(false);
 
   // Selected/Creating AccountMove state
   const [editingMoveId, setEditingMoveId] = useState<number | null | undefined>(undefined);
@@ -191,6 +194,8 @@ export const App: React.FC = () => {
     setEditingMoveId(id);
   };
 
+  const activeCompany = companies.find((c) => c.id === companyId) ?? companies[0];
+
   return (
     <div className="min-h-screen bg-slate-50">
       <AppSwitcher
@@ -207,7 +212,20 @@ export const App: React.FC = () => {
         locale={locale}
         onToggleLocale={() => setLocale((l) => (l === "en" ? "ar" : "en"))}
         user={user}
+        onOpenLogin={() => setLoginOpen(true)}
       />
+
+      {loginOpen && (
+        <LoginModal
+          locale={locale}
+          currentUser={user}
+          onClose={() => setLoginOpen(false)}
+          onSuccess={() => {
+            setCompanyId(null);
+            queryClient.invalidateQueries();
+          }}
+        />
+      )}
 
       {/* Accounting Secondary Sub-Navigation Bar */}
       {activeApp === "accounting" && (
@@ -219,6 +237,7 @@ export const App: React.FC = () => {
                 { id: "invoices", label: t(locale, "customerInvoices") },
                 { id: "bills", label: t(locale, "vendorBills") },
                 { id: "moves", label: t(locale, "journalEntries") },
+                { id: "bank_closing", label: t(locale, "bankAndClosing") },
                 { id: "reports", label: t(locale, "reports") },
               ] as { id: AccountingSubView; label: string }[]
             ).map((item) => (
@@ -265,6 +284,11 @@ export const App: React.FC = () => {
                   setAcctView("moves");
                 }}
                 onOpenReports={() => setAcctView("reports")}
+              />
+            ) : activeApp === "accounting" && acctView === "bank_closing" ? (
+              <PeriodClosingAndBank
+                locale={locale}
+                currencySymbol={activeCompany?.currency_symbol || "$"}
               />
             ) : activeApp === "accounting" && acctView === "reports" ? (
               <FinancialReports locale={locale} onOpenMove={(id) => openExistingMove(id)} />
@@ -353,7 +377,9 @@ export const App: React.FC = () => {
         {activeApp === "contacts" && <ContactsView locale={locale} />}
 
         {/* CONFIGURATION APP */}
-        {activeApp === "configuration" && <ConfigurationView locale={locale} />}
+        {activeApp === "configuration" && (
+          <ConfigurationView locale={locale} activeCompany={activeCompany} />
+        )}
       </main>
     </div>
   );

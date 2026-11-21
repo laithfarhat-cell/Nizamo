@@ -60,6 +60,7 @@ def create_engine_from_url(url: str) -> AsyncEngine:
     kwargs: dict = {"echo": settings.DEBUG, "future": True}
     if url.startswith("sqlite"):
         connect_args["check_same_thread"] = False
+        connect_args["timeout"] = 30
         kwargs["connect_args"] = connect_args
     else:
         kwargs["pool_pre_ping"] = True

@@ -1,10 +1,10 @@
-"""Atomic Gapless Document Sequence Generator with SELECT ... FOR UPDATE locking."""
+"""Atomic Gapless Document Sequence Generator with SELECT ... FOR UPDATE & atomic UPDATE ... RETURNING."""
 
 from __future__ import annotations
 
 from datetime import date
 
-from sqlalchemy import Integer, String, UniqueConstraint, select
+from sqlalchemy import Integer, String, UniqueConstraint, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -33,22 +33,41 @@ class IrSequence(Base, TimestampMixin, CompanyScopedMixin):
         return f"{prefix}{number:0{self.padding}d}{suffix}"
 
 
+def _format_parts(prefix: str, suffix: str, padding: int, number: int, ref_date: date | None = None) -> str:
+    d = ref_date or date.today()
+    p = prefix.replace("%(year)s", f"{d.year:04d}").replace("%(month)s", f"{d.month:02d}")
+    s = suffix.replace("%(year)s", f"{d.year:04d}").replace("%(month)s", f"{d.month:02d}")
+    return f"{p}{number:0{padding}d}{s}"
+
+
 async def next_sequence_by_id(
     session: AsyncSession, sequence_id: int, ref_date: date | None = None
 ) -> str:
-    """Atomically lock the sequence row (`SELECT ... FOR UPDATE`), increment, and format."""
+    """Atomically lock and increment the sequence row using DB-level atomic UPDATE ... RETURNING."""
     async with atomic_lock(session):
-        stmt = apply_for_update(
-            select(IrSequence).where(IrSequence.id == sequence_id),
-            session,
+        bind = session.get_bind()
+        if bind is not None and bind.dialect.name == "postgresql":
+            # Acquire explicit PostgreSQL row lock first (`SELECT ... FOR UPDATE`)
+            await session.execute(
+                apply_for_update(select(IrSequence.id).where(IrSequence.id == sequence_id), session)
+            )
+        upd = (
+            update(IrSequence)
+            .where(IrSequence.id == sequence_id)
+            .values(number_next=IrSequence.number_next + IrSequence.number_increment)
+            .returning(
+                IrSequence.prefix,
+                IrSequence.suffix,
+                IrSequence.padding,
+                IrSequence.number_next,
+                IrSequence.number_increment,
+            )
         )
-        seq = (await session.execute(stmt)).scalar_one_or_none()
-        if seq is None:
+        row = (await session.execute(upd)).one_or_none()
+        if row is None:
             raise ValueError(f"Sequence id={sequence_id} not found")
-        current = seq.number_next
-        seq.number_next = current + seq.number_increment
-        await session.flush()
-        return seq.format_number(current, ref_date)
+        current = row.number_next - row.number_increment
+        return _format_parts(row.prefix, row.suffix, row.padding, current, ref_date)
 
 
 async def next_sequence_by_code(
@@ -60,31 +79,48 @@ async def next_sequence_by_code(
     default_prefix: str | None = None,
     default_padding: int = 5,
 ) -> str:
-    """Atomically fetch next gapless number for `(company_id, code)` with row locking."""
+    """Atomically fetch next gapless number for `(company_id, code)` with zero race conditions."""
     async with atomic_lock(session):
-        stmt = apply_for_update(
-            select(IrSequence).where(
-                IrSequence.company_id == company_id,
-                IrSequence.code == code,
-            ),
-            session,
-        )
-        seq = (await session.execute(stmt)).scalar_one_or_none()
-        if seq is None:
-            prefix = default_prefix if default_prefix is not None else f"{code.upper()}/%(year)s/"
-            seq = IrSequence(
-                company_id=company_id,
-                code=code,
-                name=f"Auto Sequence {code}",
-                prefix=prefix,
-                suffix="",
-                padding=default_padding,
-                number_next=1,
-                number_increment=1,
+        bind = session.get_bind()
+        if bind is not None and bind.dialect.name == "postgresql":
+            await session.execute(
+                apply_for_update(
+                    select(IrSequence.id).where(
+                        IrSequence.company_id == company_id,
+                        IrSequence.code == code,
+                    ),
+                    session,
+                )
             )
-            session.add(seq)
-            await session.flush()
-        current = seq.number_next
-        seq.number_next = current + seq.number_increment
+        upd = (
+            update(IrSequence)
+            .where(IrSequence.company_id == company_id, IrSequence.code == code)
+            .values(number_next=IrSequence.number_next + IrSequence.number_increment)
+            .returning(
+                IrSequence.prefix,
+                IrSequence.suffix,
+                IrSequence.padding,
+                IrSequence.number_next,
+                IrSequence.number_increment,
+            )
+        )
+        row = (await session.execute(upd)).one_or_none()
+        if row is not None:
+            current = row.number_next - row.number_increment
+            return _format_parts(row.prefix, row.suffix, row.padding, current, ref_date)
+
+        # Auto-create sequence if missing (initial bootstrap)
+        prefix = default_prefix if default_prefix is not None else f"{code.upper()}/%(year)s/"
+        seq = IrSequence(
+            company_id=company_id,
+            code=code,
+            name=f"Auto Sequence {code}",
+            prefix=prefix,
+            suffix="",
+            padding=default_padding,
+            number_next=2,
+            number_increment=1,
+        )
+        session.add(seq)
         await session.flush()
-        return seq.format_number(current, ref_date)
+        return seq.format_number(1, ref_date)

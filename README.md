@@ -14,7 +14,11 @@
 
 ### 2. Double-Entry Accounting Engine (`backend/modules/accounting/`)
 - **Unified Document Model**: General Journal Entries, Customer Invoices, Vendor Bills, Credit Notes, and Payments unified under `account_move` & `account_move_line`.
-- **Strict Ledger Invariants**: Rejects unbalanced entries ($\sum \text{debit} \ne \sum \text{credit}$), blocks edits/deletes on `POSTED` entries (requiring automated Reversal Entries / Credit Notes), and enforces `fiscalyear_lock_date` & `tax_lock_date`.
+- **Strict Ledger Invariants + PostgreSQL Immutability Trigger (`0002_production_hardening_and_v2`)**: Rejects unbalanced entries ($\sum \text{debit} \ne \sum \text{credit}$), enforces a native PostgreSQL `BEFORE UPDATE OR DELETE` trigger blocking mutation/deletion of `POSTED` `account_move_line` financial columns, supports safe draft editing (`PUT /accounting/moves/{id}`) with Chatter field diffs, and enforces `fiscalyear_lock_date` & `tax_lock_date`.
+- **Official Invoice PDF + ZATCA Phase-1 QR Code (`invoice_pdf.py`)**: Generates A4 tax invoices/bills/credit notes embedding a ZATCA-compliant Base64 TLV QR Code (Tags 1–5: Seller Name, VAT Number, Timestamp, Invoice Total, VAT Total) via `GET /accounting/moves/{id}/pdf`.
+- **Year-End Fiscal Closing Wizard (`closing_engine.py`)**: Previews and posts a balanced closing journal entry zeroing all Income & Expense accounts into Retained Earnings (`310000`) and automatically locks `fiscalyear_lock_date`.
+- **Unrealized FX Revaluation — IAS 21 (`closing_engine.py`)**: Computes period-end unrealized FX gains/losses on open foreign-currency receivables/payables and posts revaluation entries with optional next-day auto-reversal.
+- **Bank Statement CSV Import & Smart Reconciliation (`bank_reconciliation.py`)**: Imports CSV bank feeds, auto-matches lines against open customer invoices & vendor bills with confidence scoring, and settles them in one click.
 - **Tax Engine (`tax_engine.py`)**: Supports percentage taxes (e.g., 15% VAT), fixed per-unit taxes, price-included pricing, and cascading/compound taxes (`include_base_amount`).
 - **Payments, Partial Reconciliation & Realized FX Gain/Loss (`reconciliation.py`)**: Tracks `amount_residual` & `payment_state` (`NOT_PAID`, `PARTIAL`, `PAID`) and auto-posts balanced Realized FX Gain/Loss entries when settlement exchange rates differ from invoice dates.
 - **Real-Time Financial Reporting (`reports.py`)**: Trial Balance (ميزان المراجعة), Profit & Loss (قائمة الدخل), Balance Sheet (الميزانية العمومية — verifying $\text{Assets} == \text{Liabilities} + \text{Equity}$), General Ledger (دفتر الأستاذ العام) with drill-down, and Aged Receivable/Payable (`Current`, `1–30`, `31–60`, `61–90`, `90+`) with **CSV, XLSX, and PDF** export.
@@ -24,9 +28,9 @@
 - **Sales Cycle (`backend/modules/sales/`)**: `Quotation` → `Confirmed SO` → auto `Delivery Order` → `Customer Invoice` (`ORDERED` or `DELIVERED` policy) → `Payment & Reconciliation`.
 - **Purchase Cycle (`backend/modules/purchase/`)**: `RFQ` → `Confirmed PO` → auto `Incoming Shipment` → `Vendor Bill` with **3-Way Matching** (`Ordered Qty` vs `Received Qty` vs `Billed Qty`) → `Payment & Reconciliation`.
 
-### 4. Odoo-Inspired Bilingual Web UI (`frontend/src/`)
-- **App Switcher & Multi-Company Shell**: `Accounting`, `Invoicing`, `Sales`, `Purchase`, `Inventory`, `Contacts`, `Configuration`, plus live **English (LTR) / Arabic (RTL)** toggle.
-- **Unified Multi-View UX**: High-density `TanStack Table` List View (search, filter chips, `Group By`, column sum footers, bulk actions), Form View with Statusbar Pipeline, live Smart Buttons, inline Invoice/Journal Editor, Accounting Journal Cards Dashboard, and Audit Chatter timeline.
+### 4. Odoo-Inspired Bilingual Web UI & Production DevOps (`frontend/src/`, `.github/workflows/ci.yml`)
+- **App Switcher, JWT Login / RBAC Role Switcher & Multi-Company Shell**: `Accounting` (incl. `Bank & Closing` CPA workspace), `Invoicing`, `Sales`, `Purchase`, `Inventory`, `Contacts`, `Configuration` (CoA, FX Rates, Lock Dates, Modules), plus live **English (LTR) / Arabic (RTL)** toggle.
+- **Production Packaging & CI**: Multi-stage Nginx frontend container (`frontend/Dockerfile`), JWT Access + Refresh token rotation with `ALLOW_DEMO_FALLBACK=false` strict production mode, and GitHub Actions CI running Alembic migrations, PostgreSQL 16 trigger verification, `pytest` (15 tests), and Vite production builds.
 
 ---
 

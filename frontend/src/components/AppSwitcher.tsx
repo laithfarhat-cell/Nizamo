@@ -23,6 +23,7 @@ interface AppSwitcherProps {
   locale: Locale;
   onToggleLocale: () => void;
   user: UserInfo | null;
+  onOpenLogin: () => void;
 }
 
 const APPS: { key: AppKey; icon: React.ComponentType<{ className?: string }>; color: string }[] = [
@@ -44,6 +45,7 @@ export const AppSwitcher: React.FC<AppSwitcherProps> = ({
   locale,
   onToggleLocale,
   user,
+  onOpenLogin,
 }) => {
   const [drawerOpen, setDrawerOpen] = useState(false);
 
@@ -146,17 +148,22 @@ export const AppSwitcher: React.FC<AppSwitcherProps> = ({
             <span>{locale === "en" ? "العربية (RTL)" : "English (LTR)"}</span>
           </button>
 
-          {user && (
-            <div className="hidden sm:flex items-center gap-2 border-s border-white/20 ps-2.5">
-              <div className="flex h-7 w-7 items-center justify-center rounded-full bg-odoo-teal text-xs font-bold uppercase">
-                {user.full_name.slice(0, 2)}
-              </div>
-              <div className="leading-tight">
-                <div className="text-xs font-medium">{user.full_name}</div>
-                <div className="text-[10px] text-white/70">{user.roles.join(" · ")}</div>
+          <button
+            type="button"
+            onClick={onOpenLogin}
+            className="flex items-center gap-2 border-s border-white/20 ps-2.5 hover:opacity-90 transition text-start"
+            title={t(locale, "signIn")}
+          >
+            <div className="flex h-7 w-7 items-center justify-center rounded-full bg-odoo-teal text-xs font-bold uppercase">
+              {user ? user.full_name.slice(0, 2) : "IN"}
+            </div>
+            <div className="hidden sm:block leading-tight">
+              <div className="text-xs font-medium">{user ? user.full_name : t(locale, "signIn")}</div>
+              <div className="text-[10px] text-white/70">
+                {user ? user.roles.join(" · ") : "JWT Auth"}
               </div>
             </div>
-          )}
+          </button>
         </div>
       </div>
     </header>

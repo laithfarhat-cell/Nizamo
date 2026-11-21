@@ -9,7 +9,7 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
     APP_NAME: str = "Nizamo ERP"
-    APP_VERSION: str = "1.0.0"
+    APP_VERSION: str = "2.0.0"
     DEBUG: bool = False
 
     # Production defaults to PostgreSQL 16 via asyncpg; override with sqlite+aiosqlite for local sandbox/testing
@@ -18,7 +18,11 @@ class Settings(BaseSettings):
 
     JWT_SECRET: str = "nizamo-erp-enterprise-secret-change-in-production-2026"
     JWT_ALGORITHM: str = "HS256"
-    JWT_EXPIRE_MINUTES: int = 60 * 24
+    JWT_EXPIRE_MINUTES: int = 60 * 12
+    REFRESH_TOKEN_EXPIRE_DAYS: int = 7
+
+    # Set ALLOW_DEMO_FALLBACK=false in production to strictly require Bearer JWT on all requests
+    ALLOW_DEMO_FALLBACK: bool = True
 
     DEFAULT_COMPANY_CODE: str = "NIZAMO"
     CORS_ORIGINS: list[str] = ["*"]

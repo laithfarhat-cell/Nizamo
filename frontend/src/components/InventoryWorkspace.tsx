@@ -12,7 +12,19 @@ interface InventoryWorkspaceProps {
 export const InventoryWorkspace: React.FC<InventoryWorkspaceProps> = ({ locale }) => {
   const [subTab, setSubTab] = useState<"transfers" | "products" | "quants" | "valuation">("transfers");
   const [banner, setBanner] = useState<string | null>(null);
+  const [sku, setSku] = useState("");
+  const [prodName, setProdName] = useState("");
+  const [catId, setCatId] = useState<number>(0);
+  const [listPrice, setListPrice] = useState("100.00");
+  const [stdPrice, setStdPrice] = useState("60.00");
   const queryClient = useQueryClient();
+
+  const { data: categories = [] } = useQuery<
+    Array<{ id: number; name: string; costing_method: string }>
+  >({
+    queryKey: ["product-categories"],
+    queryFn: () => apiRequest("/inventory/categories"),
+  });
 
   const { data: pickings = [] } = useQuery<StockPicking[]>({
     queryKey: ["pickings"],
@@ -154,7 +166,75 @@ export const InventoryWorkspace: React.FC<InventoryWorkspaceProps> = ({ locale }
 
       {/* Products */}
       {subTab === "products" && (
-        <div className="overflow-x-auto rounded-xl border border-slate-200 bg-white shadow-sm">
+        <div className="space-y-4">
+          <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
+            <h3 className="text-xs font-bold uppercase text-slate-600 mb-2">Add New Product</h3>
+            <div className="grid grid-cols-1 md:grid-cols-6 gap-2 text-xs">
+              <input
+                placeholder="SKU (e.g. PRO-001)"
+                value={sku}
+                onChange={(e) => setSku(e.target.value)}
+                className="border border-slate-300 rounded px-2 py-1.5 font-mono"
+              />
+              <input
+                placeholder="Product Name*"
+                value={prodName}
+                onChange={(e) => setProdName(e.target.value)}
+                className="border border-slate-300 rounded px-2 py-1.5"
+              />
+              <select
+                value={catId || categories[0]?.id || ""}
+                onChange={(e) => setCatId(Number(e.target.value))}
+                className="border border-slate-300 rounded px-2 py-1.5"
+              >
+                {categories.map((c) => (
+                  <option key={c.id} value={c.id}>
+                    {c.name} ({c.costing_method})
+                  </option>
+                ))}
+              </select>
+              <input
+                placeholder="Cost Price"
+                value={stdPrice}
+                onChange={(e) => setStdPrice(e.target.value)}
+                className="border border-slate-300 rounded px-2 py-1.5 font-mono"
+              />
+              <input
+                placeholder="Sales Price"
+                value={listPrice}
+                onChange={(e) => setListPrice(e.target.value)}
+                className="border border-slate-300 rounded px-2 py-1.5 font-mono"
+              />
+              <button
+                disabled={!sku || !prodName}
+                onClick={async () => {
+                  try {
+                    setBanner(null);
+                    await apiRequest("/inventory/products", {
+                      method: "POST",
+                      body: JSON.stringify({
+                        default_code: sku,
+                        name: prodName,
+                        category_id: catId || categories[0]?.id,
+                        standard_price: stdPrice,
+                        list_price: listPrice,
+                      }),
+                    });
+                    setSku("");
+                    setProdName("");
+                    await queryClient.invalidateQueries({ queryKey: ["products"] });
+                  } catch (e: unknown) {
+                    setBanner(e instanceof Error ? e.message : "Failed to create product");
+                  }
+                }}
+                className="rounded-lg bg-odoo-purple px-3 py-1.5 font-semibold text-white disabled:opacity-50"
+              >
+                + Add Product
+              </button>
+            </div>
+          </div>
+
+          <div className="overflow-x-auto rounded-xl border border-slate-200 bg-white shadow-sm">
           <table className="w-full text-start text-xs tabular-nums">
             <thead className="border-b border-slate-200 bg-slate-50 text-[11px] uppercase text-slate-500">
               <tr>
@@ -187,6 +267,7 @@ export const InventoryWorkspace: React.FC<InventoryWorkspaceProps> = ({ locale }
               ))}
             </tbody>
           </table>
+          </div>
         </div>
       )}
 

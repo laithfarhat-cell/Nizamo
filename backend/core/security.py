@@ -145,22 +145,35 @@ def verify_password(password: str, stored_hash: str) -> bool:
         return False
 
 
-# --- JWT Token Helpers ---
+# --- JWT Access & Refresh Token Helpers ---
 
 def create_access_token(user_id: int, login: str) -> str:
     expire = datetime.now(timezone.utc) + timedelta(minutes=settings.JWT_EXPIRE_MINUTES)
-    payload = {"sub": str(user_id), "login": login, "exp": expire}
+    payload = {"sub": str(user_id), "login": login, "type": "access", "exp": expire}
     return jwt.encode(payload, settings.JWT_SECRET, algorithm=settings.JWT_ALGORITHM)
 
 
-def decode_access_token(token: str) -> dict:
+def create_refresh_token(user_id: int, login: str) -> str:
+    expire = datetime.now(timezone.utc) + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)
+    payload = {"sub": str(user_id), "login": login, "type": "refresh", "exp": expire}
+    return jwt.encode(payload, settings.JWT_SECRET, algorithm=settings.JWT_ALGORITHM)
+
+
+def decode_access_token(token: str, expected_type: str = "access") -> dict:
     try:
-        return jwt.decode(token, settings.JWT_SECRET, algorithms=[settings.JWT_ALGORITHM])
+        payload = jwt.decode(token, settings.JWT_SECRET, algorithms=[settings.JWT_ALGORITHM])
     except jwt.PyJWTError as exc:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or expired authentication token",
         ) from exc
+    token_type = payload.get("type", "access")
+    if token_type != expected_type:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=f"Invalid token type: expected '{expected_type}'",
+        )
+    return payload
 
 
 # --- FastAPI Request Context & RBAC Dependencies ---
@@ -203,7 +216,12 @@ async def get_current_context(
         if user is None:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User inactive or missing")
     else:
-        # Seamless demo access using the default System Admin user when frontend opens initially
+        if not settings.ALLOW_DEMO_FALLBACK:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Authentication required. Supply a valid Bearer access token.",
+            )
+        # Seamless demo access using the default System Admin user when ALLOW_DEMO_FALLBACK=true
         stmt = (
             select(ResUser)
             .options(selectinload(ResUser.groups), selectinload(ResUser.companies))
